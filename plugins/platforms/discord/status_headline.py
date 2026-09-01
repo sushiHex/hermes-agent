@@ -221,17 +221,13 @@ class StatusHeadline:
         role_id = _positive_int(record.get("helper_role_id"), "helper role id")
         category_id = _positive_int(record.get("category_id"), "category id")
         channel_ids = record.get("channel_ids")
-        if not isinstance(channel_ids, dict) or tuple(channel_ids) not in {
-            _LEGACY_ROWS,
-            _ALL_ROWS,
+        if not isinstance(channel_ids, dict) or frozenset(channel_ids) not in {
+            frozenset(_LEGACY_ROWS),
+            frozenset(_ALL_ROWS),
         }:
-            if not isinstance(channel_ids, dict) or frozenset(channel_ids) not in {
-                frozenset(_LEGACY_ROWS),
-                frozenset(_ALL_ROWS),
-            }:
-                raise RuntimeError(
-                    "Discord status headline ownership is not exact four- or five-row state"
-                )
+            raise RuntimeError(
+                "Discord status headline ownership is not exact four- or five-row state"
+            )
         ids = [self.guild_id, role_id, category_id]
         ids.extend(_positive_int(value, f"{key} row id") for key, value in channel_ids.items())
         if len(ids) != len(set(ids)):

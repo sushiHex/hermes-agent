@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 _DISCORD_MARKDOWN_LINK_LABEL_RE = re.compile(r"([\\\[\]])")
 _DISCORD_URL_LABEL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+_STATUS_HEADLINE_GUILD_OWNERS: Dict[int, object] = {}
 
 
 def _format_discord_markdown_link(label: str, url: str) -> str:
@@ -1056,6 +1057,7 @@ class DiscordAdapter(BasePlatformAdapter):
     # incident delivered 60,698 chars as 31 messages).  Chunks beyond the
     # cap are replaced by a short notice.
     MAX_SPLIT_MESSAGES = 8
+    STATUS_HEADLINE_LOCK_SCOPE = "discord-status-sidebar-guild"
 
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
@@ -1122,6 +1124,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
+        self._status_headline_task: Optional[asyncio.Task] = None
         # WebSocket-level liveness probe. Discord REST and Gateway are distinct
         # transports: a REST 200 cannot prove that this client is still receiving
         # Gateway events. Sample the current Discord WebSocket's ready/open/ACK
@@ -1368,6 +1371,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # on reconnect (see #18187). Without this, the old client remains
             # connected to Discord gateway and both fire on_message, causing
             # double responses.
+            await self._cancel_status_headline_task()
             if self._client is not None:
                 try:
                     if not self._client.is_closed():
@@ -1400,6 +1404,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 adapter_self._post_connect_task = asyncio.create_task(
                     adapter_self._run_post_connect_initialization()
                 )
+                adapter_self._ensure_status_headline_task()
                 if adapter_self._missed_message_backfill_enabled():
                     adapter_self._ensure_missed_message_backfill_task()
 
@@ -2156,9 +2161,104 @@ class DiscordAdapter(BasePlatformAdapter):
         deadline = max(1.0, budget - headroom)
         return min(deadline, budget * 0.9)
 
+    def _status_headline_config(self) -> Optional[Dict[str, Any]]:
+        extra = self.config.extra if isinstance(getattr(self.config, "extra", None), dict) else {}
+        value = extra.get("status_sidebar")
+        if not isinstance(value, dict) or value.get("enabled") is not True:
+            return None
+        return value
+
+    def _ensure_status_headline_task(self) -> Optional[asyncio.Task]:
+        if self._status_headline_config() is None or self._client is None:
+            return None
+        task = getattr(self, "_status_headline_task", None)
+        if task is not None and not task.done():
+            return task
+        self._status_headline_task = asyncio.create_task(self._run_status_headline())
+        return self._status_headline_task
+
+    async def _cancel_status_headline_task(self) -> None:
+        task = getattr(self, "_status_headline_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        self._status_headline_task = None
+
+    async def _run_status_headline(self) -> None:
+        config = self._status_headline_config()
+        client = self._client
+        if config is None or client is None:
+            return
+        from plugins.platforms.discord.status_headline import StatusHeadline
+
+        try:
+            interval = max(
+                310.0,
+                float(config.get("refresh_interval_seconds", 310.0)),
+            )
+        except (TypeError, ValueError):
+            interval = 310.0
+        headline = None
+        owner_token = object()
+        owned_guild_id = None
+        lock_identity = None
+        try:
+            while self._client is client:
+                try:
+                    if headline is None:
+                        candidate = StatusHeadline(client, discord, config, self.gateway_runner)
+                        guild_id = candidate.guild_id
+                        if guild_id in _STATUS_HEADLINE_GUILD_OWNERS:
+                            raise RuntimeError(
+                                f"guild {guild_id} already has a status headline writer"
+                            )
+                        _STATUS_HEADLINE_GUILD_OWNERS[guild_id] = owner_token
+                        owned_guild_id = guild_id
+                        from gateway.status import acquire_scoped_lock
+
+                        try:
+                            identity = str(guild_id)
+                            acquired, _existing = acquire_scoped_lock(
+                                self.STATUS_HEADLINE_LOCK_SCOPE,
+                                identity,
+                                metadata={"guild_id": guild_id},
+                            )
+                            if not acquired:
+                                raise RuntimeError(
+                                    f"guild {guild_id} already has a status headline writer"
+                                )
+                        except BaseException:
+                            if _STATUS_HEADLINE_GUILD_OWNERS.get(guild_id) is owner_token:
+                                _STATUS_HEADLINE_GUILD_OWNERS.pop(guild_id, None)
+                            owned_guild_id = None
+                            raise
+                        headline = candidate
+                        lock_identity = identity
+                    await headline.run_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("[%s] Status headline refused update: %s", self.name, exc)
+                await asyncio.sleep(interval)
+        finally:
+            if (
+                owned_guild_id is not None
+                and _STATUS_HEADLINE_GUILD_OWNERS.get(owned_guild_id) is owner_token
+            ):
+                try:
+                    if lock_identity is not None:
+                        from gateway.status import release_scoped_lock
+
+                        release_scoped_lock(self.STATUS_HEADLINE_LOCK_SCOPE, lock_identity)
+                finally:
+                    if _STATUS_HEADLINE_GUILD_OWNERS.get(owned_guild_id) is owner_token:
+                        _STATUS_HEADLINE_GUILD_OWNERS.pop(owned_guild_id, None)
+
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
         self._disconnecting = True
+        await self._cancel_status_headline_task()
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
@@ -2206,6 +2306,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client = None
         self._ready_event.clear()
         self._post_connect_task = None
+        self._status_headline_task = None
         self._liveness_task = None
         self._missed_message_backfill_task = None
 

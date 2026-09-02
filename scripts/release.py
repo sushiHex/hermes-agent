@@ -2074,6 +2074,10 @@ LEGACY_AUTHOR_MAP = {
     "1torhan@protonmail.com": "uzaylisak",  # PR #29988 salvage (detect_local_server_type process-lifetime cache)
     "zhchl@hermes-agent.local": "8294",  # PR #50572 salvage (honor config context_length on banner)
     "yansh2017@gmail.com": "ya-nsh",  # PR #26790 salvage (normalize local terminal relative cwd; #26783)
+    # Raw-email filenames collide under Windows case-folding. Keep both exact
+    # identities here rather than weakening attribution or the runtime selector.
+    "agent@Agents-Mac-mini.local": "skip-agent",
+    "agent@agents-Mac-mini.local": "momomojo",
 }
 
 

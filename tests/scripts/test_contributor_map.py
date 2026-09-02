@@ -32,6 +32,25 @@ def test_loader_reads_login_from_first_noncomment_line(tmp_path):
     assert mapping == {"jane@example.com": "janedoe"}
 
 
+def test_case_variant_machine_emails_preserve_distinct_attribution():
+    assert release.AUTHOR_MAP["agent@Agents-Mac-mini.local"] == "skip-agent"
+    assert release.AUTHOR_MAP["agent@agents-Mac-mini.local"] == "momomojo"
+
+
+def test_tracked_paths_are_casefold_unique():
+    output = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=True,
+    ).stdout
+    paths = [path.decode("utf-8") for path in output.split(b"\0") if path]
+    folded = {}
+    for path in paths:
+        prior = folded.setdefault(path.casefold(), path)
+        assert prior == path, f"tracked paths collide under case-folding: {prior!r}, {path!r}"
+
+
 
 
 

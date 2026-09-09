@@ -442,6 +442,22 @@ class TestLoadGatewayConfig:
         assert extra["websocket_heartbeat_ack_max_age_seconds"] == 75
         assert extra["websocket_max_latency_seconds"] == 30
 
+    def test_discord_status_sidebar_seeds_platform_extra(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "discord:\n  enabled: true\n  status_sidebar:\n    enabled: true\n    guild_id: 599058359567646750\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra["status_sidebar"] == {
+            "enabled": True,
+            "guild_id": 599058359567646750,
+        }
+
     def test_session_reset_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """``gateway.session_reset`` (nested form) must reach default_reset_policy,
         mirroring the gateway.multiplex_profiles precedent."""

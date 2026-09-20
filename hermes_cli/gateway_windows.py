@@ -62,8 +62,10 @@ _ACCESS_DENIED_PATTERN = re.compile(r"(access is denied|acceso denegado)", re.IG
 _TASK_NAME_DEFAULT = "Hermes_Gateway"
 _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 _TASK_LOGON_DELAY = "PT30S"
-_TASK_RESTART_INTERVAL = "PT1M"
-_TASK_RESTART_COUNT = 999
+_SUPERVISOR_RESTART_EXIT_CODE = 75
+_SUPERVISOR_FATAL_EXIT_CODE = 78
+_SUPERVISOR_FAST_RETRY_MS = 5_000
+_SUPERVISOR_BACKOFF_MS = 60_000
 
 
 def _schtasks_encoding() -> str:
@@ -469,12 +471,15 @@ def _build_gateway_vbs_script(
 
     ``wscript.exe`` is a GUI-subsystem executable with no console, so this
     launcher receives no console control events. It ``Run``s the console
-    ``python.exe`` with window style 0 (hidden): the gateway owns a single
-    hidden console — never shown, never CTRL_CLOSE'd at logon, and inherited
-    by every console-subsystem descendant (git, gh, node, …) so none of them
-    allocate a visible flashing conhost (#54220/#56747; the previous
-    console-less pythonw.exe gateway forced exactly that per-descendant
-    flash). No cmd.exe anywhere in the chain. Mirrors
+    ``python.exe`` with window style 0 (hidden) and remains its supervisor: the
+    gateway owns a single hidden console — never shown, never CTRL_CLOSE'd at
+    logon, and inherited by every console-subsystem descendant (git, gh, node,
+    …) so none of them allocate a visible flashing conhost (#54220/#56747; the
+    previous console-less pythonw.exe gateway forced exactly that per-descendant
+    flash). The wrapper exits on clean shutdown or fatal configuration and
+    otherwise restarts with bounded backoff. This is deliberate: real Windows
+    Scheduler probes showed that propagating a nonzero action result does not
+    reliably trigger ``RestartOnFailure``. No cmd.exe anywhere in the chain. Mirrors
     ``_build_gateway_cmd_script`` (same env + argv via
     ``_resolve_detached_python``).
     """
@@ -483,7 +488,7 @@ def _build_gateway_vbs_script(
     prog_args = [python_exe_path, "-m", "hermes_cli.main"]
     if profile_arg:
         prog_args.extend(profile_arg.split())
-    prog_args.extend(["gateway", "run"])
+    prog_args.extend(["gateway", "run", "--external-supervisor"])
     # list2cmdline gives CreateProcess-correct quoting for WScript.Shell.Run.
     command_line = subprocess.list2cmdline(prog_args)
 
@@ -495,7 +500,7 @@ def _build_gateway_vbs_script(
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp",
+        "Dim sh, env, existing_pp, exitCode",
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({_quote_vbs_string('HERMES_HOME')}) = {_quote_vbs_string(hermes_home)}",
@@ -512,10 +517,17 @@ def _build_gateway_vbs_script(
         f"  env.Item({_quote_vbs_string('PYTHONPATH')}) = {_quote_vbs_string(static_pythonpath)}",
         "End If",
         f"sh.CurrentDirectory = {_quote_vbs_string(working_dir)}",
-        # Window style 0 = hidden; bWaitOnReturn False = detached/async. The
-        # console python's one console is created hidden and inherited by all
-        # descendants, so nothing ever flashes.
-        f"sh.Run {_quote_vbs_string(command_line)}, 0, False",
+        "Do",
+        # Window style 0 = hidden; bWaitOnReturn True makes this wrapper the
+        # single restart owner instead of relying on Scheduler retry semantics.
+        f"  exitCode = sh.Run({_quote_vbs_string(command_line)}, 0, True)",
+        f"  If exitCode = 0 Or exitCode = {_SUPERVISOR_FATAL_EXIT_CODE} Then WScript.Quit 0",
+        f"  If exitCode = {_SUPERVISOR_RESTART_EXIT_CODE} Then",
+        f"    WScript.Sleep {_SUPERVISOR_FAST_RETRY_MS}",
+        "  Else",
+        f"    WScript.Sleep {_SUPERVISOR_BACKOFF_MS}",
+        "  End If",
+        "Loop",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -622,7 +634,7 @@ def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
+    <StartWhenAvailable>false</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <IdleSettings>
       <StopOnIdleEnd>false</StopOnIdleEnd>
@@ -635,10 +647,6 @@ def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
-    <RestartOnFailure>
-      <Interval>{_TASK_RESTART_INTERVAL}</Interval>
-      <Count>{_TASK_RESTART_COUNT}</Count>
-    </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
     <Exec>

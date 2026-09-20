@@ -728,6 +728,15 @@ def _install_startup_entry(script_path: Path) -> Path:
     return entry
 
 
+def _remove_startup_entries() -> None:
+    """Remove login launchers so a Scheduled Task remains the sole owner."""
+    for entry in (get_startup_entry_path(), _legacy_startup_entry_path()):
+        try:
+            entry.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _resolve_detached_python(python_exe: str) -> tuple[str, Path, list[str]]:
     """Return (hidden_console_python, venv_dir, extra_pythonpath) for detached runs.
 
@@ -1011,7 +1020,7 @@ def _prompt_install_choices(
     start_now: bool | None = None,
     start_on_login: bool | None = None,
 ) -> tuple[bool, bool]:
-    """Return (start_now, start_on_login), asking before any UAC escalation."""
+    """Return the requested immediate-start and login-start behavior."""
     env_start_now = _install_choice_from_env("HERMES_GATEWAY_INSTALL_START_NOW")
     env_start_on_login = _install_choice_from_env("HERMES_GATEWAY_INSTALL_START_ON_LOGIN")
     if start_now is None:
@@ -1027,7 +1036,7 @@ def _prompt_install_choices(
         start_now = prompt_yes_no("Start the gateway now after install?", True)
     if start_on_login is None:
         start_on_login = prompt_yes_no(
-            "Start the gateway automatically on Windows login with a Scheduled Task?",
+            "Start the gateway automatically on Windows login?",
             True,
         )
     return start_now, start_on_login
@@ -1041,9 +1050,8 @@ def _install_startup_fallback(script_path: Path, start_now: bool, detail: str) -
     print(f"  Task script: {script_path}")
 
     # Re-running `hermes -p <profile> gateway install` must be safe.
-    # Startup-folder fallback only installs login persistence. Starting is
-    # controlled by the pre-UAC start_now answer so all user decisions happen
-    # before any elevation prompt.
+    # Startup-folder fallback only installs login persistence. Immediate
+    # startup remains controlled by the explicit ``start_now`` choice.
     from hermes_cli.gateway import find_gateway_pids, _profile_arg
 
     running_pids = list(find_gateway_pids())
@@ -1067,11 +1075,13 @@ def install(
     start_on_login: bool | None = None,
     elevated_handoff: bool = False,
 ) -> None:
-    """Install the gateway as a Windows Scheduled Task (with Startup fallback).
+    """Install Windows login persistence, preferring an existing Scheduled Task.
 
-    Idempotent: re-running updates the task to point at the current python/
-    project paths. ``force`` is accepted for API parity with ``launchd_install``
-    / ``systemd_install`` but isn't needed — we always reconcile.
+    Idempotent: an existing task registration is preserved while its stable
+    launcher is refreshed to the current Python/project paths. A task-free
+    profile attempts registration and falls back to the per-user Startup folder
+    when Task Scheduler denies it. ``force`` is accepted for API parity with
+    ``launchd_install`` / ``systemd_install``.
     """
     _assert_windows()
     start_now, start_on_login = _prompt_install_choices(start_now, start_on_login)
@@ -1093,31 +1103,12 @@ def install(
     task_name = get_task_name()
     script_path = _write_task_script()
 
-    # On machines where the current user's scheduled-task ACL is locked down,
-    # schtasks /Create or /Change can sit for the timeout before returning
-    # Access Denied. We already collected all intent questions above, so avoid
-    # a mysterious post-question pause: ask for UAC before touching schtasks.
-    if not _is_running_as_admin() and not elevated_handoff:
-        from hermes_cli.setup import prompt_yes_no
-
-        print("↻ Scheduled Task install may need administrator approval on this Windows account.")
-        print("  UAC is Windows' admin approval prompt; it is needed to create/update the Scheduled Task.")
-        if prompt_yes_no("  Open the UAC prompt now?", False):
-            if _launch_elevated_install(force=force, start_now=start_now, start_on_login=start_on_login):
-                print("✓ Launched elevated Hermes gateway install prompt.")
-                if start_now:
-                    print("  Approve the Windows UAC prompt; the elevated install will start the gateway afterwards.")
-                else:
-                    print("  Approve the Windows UAC prompt, then run: hermes gateway status")
-                return
-            print("⚠ Falling back to Startup folder because elevation was unavailable or cancelled.")
-        else:
-            print("  Skipped elevation. Falling back to Startup folder.")
-        _install_startup_fallback(script_path, start_now, "administrator approval was not used")
-        return
-
-    ok, detail = _install_scheduled_task(task_name, script_path)
+    if is_task_registered():
+        ok, detail = True, f"Retained existing Scheduled Task {task_name!r}; refreshed its launcher"
+    else:
+        ok, detail = _install_scheduled_task(task_name, script_path)
     if ok:
+        _remove_startup_entries()
         print(f"✓ {detail}")
         print(f"  Task script: {script_path}")
         print("ℹ Gateway auto-start installed for Windows login.")
@@ -1134,28 +1125,9 @@ def install(
         _print_next_steps()
         return
 
-    # schtasks create didn't work. Prefer a real Scheduled Task over the
-    # Startup-folder fallback when the only blocker is elevation. This gives
-    # users a UAC prompt instead of silently installing a less reliable login
-    # item, and keeps the fallback for locked-down boxes / cancelled prompts.
-    if _is_access_denied(detail) and not _is_running_as_admin():
-        from hermes_cli.setup import prompt_yes_no
-
-        print(f"↻ Scheduled Task install needs administrator approval ({detail.splitlines()[0]})")
-        print("  UAC is Windows' admin approval prompt; it is needed to create/update the Scheduled Task.")
-        if prompt_yes_no("  Open the UAC prompt now?", False):
-            if _launch_elevated_install(force=force, start_now=start_now, start_on_login=start_on_login):
-                print("✓ Launched elevated Hermes gateway install prompt.")
-                if start_now:
-                    print("  Approve the Windows UAC prompt; the elevated install will start the gateway afterwards.")
-                else:
-                    print("  Approve the Windows UAC prompt, then run: hermes gateway status")
-                return
-            print("⚠ Falling back to Startup folder because elevation was unavailable or cancelled.")
-        else:
-            print("  Skipped elevation. Falling back to Startup folder.")
-
-    # schtasks create didn't work. See if it's a "fall back to startup" case.
+    # schtasks create didn't work. Use the per-user Startup folder when the
+    # task service is locked down; routine gateway installation must not
+    # depend on someone being present to approve a UAC prompt.
     if _should_fall_back(1, detail):
         print(f"↻ Scheduled Task install blocked ({detail.splitlines()[0]}) — using Startup folder fallback")
         entry = _install_startup_entry(script_path)
@@ -1234,28 +1206,19 @@ def uninstall() -> None:
     startup_entry = get_startup_entry_path()
     legacy_startup_entry = _legacy_startup_entry_path()
 
-    scheduled_task_removed = False
     if is_task_registered():
         code, _out, err = _exec_schtasks(["/Delete", "/F", "/TN", task_name])
         detail = err.strip()
-        if code == 0:
-            scheduled_task_removed = True
-            print(f"✓ Removed Scheduled Task {task_name!r}")
-        elif _is_access_denied(detail) and not _is_running_as_admin():
-            from hermes_cli.setup import prompt_yes_no
-
-            print(f"↻ Scheduled Task uninstall needs administrator approval ({detail or 'access denied'})")
-            print("  UAC is Windows' admin approval prompt; it is needed to remove the Scheduled Task.")
-            if prompt_yes_no("  Open the UAC prompt now?", False):
-                if _launch_elevated_uninstall():
-                    print("✓ Launched elevated Hermes gateway uninstall prompt.")
-                    print("  Approve the Windows UAC prompt, then run: hermes gateway status")
-                    return
-                print("⚠ Elevated uninstall prompt was unavailable or cancelled.")
-            else:
-                print("  Skipped elevation. Scheduled Task was not removed.")
-        else:
-            print(f"⚠ schtasks /Delete returned code {code}: {detail}")
+        if code != 0:
+            raise RuntimeError(
+                f"Windows gateway uninstall incomplete: Scheduled Task {task_name!r} was not removed: "
+                f"{detail or f'schtasks exited with code {code}'}"
+            )
+        if is_task_registered():
+            raise RuntimeError(
+                f"Windows gateway uninstall incomplete: Scheduled Task {task_name!r} is still registered"
+            )
+        print(f"✓ Removed Scheduled Task {task_name!r}")
 
     for path, label in [
         (startup_entry, "Windows login item"),
@@ -1268,10 +1231,6 @@ def uninstall() -> None:
             print(f"✓ Removed {label}: {path}")
         except FileNotFoundError:
             pass
-
-    if is_task_registered() and not scheduled_task_removed:
-        print(f"⚠ Scheduled Task still registered: {task_name}")
-
 
 # ---------------------------------------------------------------------------
 # Status / start / stop / restart

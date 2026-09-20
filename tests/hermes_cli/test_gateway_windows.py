@@ -198,6 +198,7 @@ def _arrange_startup_fallback(monkeypatch, tmp_path, running_pids):
     monkeypatch.setattr(gateway_windows, "_prompt_install_choices", lambda *args, **kwargs: (False, True))
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: False)
     monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)
     monkeypatch.setattr(
         gateway_windows,
@@ -228,6 +229,143 @@ def _arrange_startup_fallback(monkeypatch, tmp_path, running_pids):
     return script_path, calls
 
 
+
+
+def test_install_refreshes_existing_task_without_mutating_registration(monkeypatch, tmp_path):
+    """A registered task is immutable; install only refreshes its launcher."""
+    script_path = tmp_path / "Hermes_Gateway.vbs"
+    startup_path = tmp_path / "Startup" / "Hermes_Gateway.vbs"
+    legacy_startup_path = startup_path.with_suffix(".cmd")
+    startup_path.parent.mkdir()
+    startup_path.write_text("duplicate", encoding="utf-8")
+    legacy_startup_path.write_text("duplicate", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_prompt_install_choices",
+        lambda start_now, start_on_login: (False, True),
+    )
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup_path)
+    monkeypatch.setattr(gateway_windows, "_legacy_startup_entry_path", lambda: legacy_startup_path)
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)
+    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: False)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_install_scheduled_task",
+        lambda *_args: pytest.fail("existing task registration must not be mutated"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_launch_elevated_install",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("unexpected elevation")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.setup.prompt_yes_no",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected prompt")),
+    )
+    monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: calls.append(("next",)))
+
+    gateway_windows.install(start_now=False, start_on_login=True)
+
+    assert calls == [("next",)]
+    assert not startup_path.exists()
+    assert not legacy_startup_path.exists()
+
+
+def test_install_removes_startup_owner_after_task_creation(monkeypatch, tmp_path):
+    """A successful fallback-to-task transition must leave one login owner."""
+    script_path = tmp_path / "Hermes_Gateway.vbs"
+    startup_path = tmp_path / "Startup" / "Hermes_Gateway.vbs"
+    legacy_startup_path = startup_path.with_suffix(".cmd")
+    startup_path.parent.mkdir()
+    startup_path.write_text("duplicate", encoding="utf-8")
+    legacy_startup_path.write_text("duplicate", encoding="utf-8")
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_prompt_install_choices",
+        lambda start_now, start_on_login: (False, True),
+    )
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: False)
+    monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup_path)
+    monkeypatch.setattr(gateway_windows, "_legacy_startup_entry_path", lambda: legacy_startup_path)
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_install_scheduled_task",
+        lambda _task_name, _path: (True, "Installed Scheduled Task 'Hermes_Gateway'"),
+    )
+    monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: None)
+
+    gateway_windows.install(start_now=False, start_on_login=True)
+
+    assert not startup_path.exists()
+    assert not legacy_startup_path.exists()
+
+
+def test_install_access_denied_falls_back_without_prompt(monkeypatch, tmp_path):
+    """A locked-down task service must use user login startup without UAC."""
+    script_path, calls = _arrange_startup_fallback(monkeypatch, tmp_path, running_pids=[1234])
+    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.setup.prompt_yes_no",
+        lambda *_args, **_kwargs: pytest.fail("install must not prompt for UAC"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_launch_elevated_install",
+        lambda **_kwargs: pytest.fail("install must not launch elevation"),
+    )
+
+    gateway_windows.install(start_now=False, start_on_login=True)
+
+    assert calls == [
+        ("install_startup", script_path),
+        ("next_steps", None),
+    ]
+
+
+def test_uninstall_preserves_launchers_when_task_delete_fails(monkeypatch, tmp_path):
+    """A registered task must never be orphaned from its launcher bytes."""
+    script_path = tmp_path / "Hermes_Gateway.cmd"
+    vbs_path = script_path.with_suffix(".vbs")
+    startup_path = tmp_path / "Startup" / "Hermes_Gateway.vbs"
+    legacy_startup_path = startup_path.with_suffix(".cmd")
+    startup_path.parent.mkdir()
+    for path in (script_path, vbs_path, startup_path, legacy_startup_path):
+        path.write_text("owned", encoding="utf-8")
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: script_path)
+    monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup_path)
+    monkeypatch.setattr(gateway_windows, "_legacy_startup_entry_path", lambda: legacy_startup_path)
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_exec_schtasks",
+        lambda _args: (1, "", "ERROR: Access is denied."),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.setup.prompt_yes_no",
+        lambda *_args, **_kwargs: pytest.fail("uninstall must not prompt for UAC"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_launch_elevated_uninstall",
+        lambda: pytest.fail("uninstall must not launch elevation"),
+    )
+
+    with pytest.raises(RuntimeError, match="Scheduled Task.*not removed"):
+        gateway_windows.uninstall()
+
+    assert all(path.exists() for path in (script_path, vbs_path, startup_path, legacy_startup_path))
 
 
 @pytest.mark.windows_only

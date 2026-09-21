@@ -252,6 +252,20 @@ def test_install_refreshes_existing_task_without_mutating_registration(monkeypat
     monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup_path)
     monkeypatch.setattr(gateway_windows, "_legacy_startup_entry_path", lambda: legacy_startup_path)
     monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)
+    exported_task_xml = gateway_windows._build_scheduled_task_xml(
+        "Hermes_Gateway",
+        script_path,
+        "DOMAIN\\alice",
+    ).replace("      <RunLevel>LeastPrivilege</RunLevel>\n", "")
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: "DOMAIN\\alice")
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user_sid", lambda: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_exec_schtasks",
+        lambda args: (0, exported_task_xml, "")
+        if "/XML" in args
+        else pytest.fail(f"unexpected schtasks call: {args}"),
+    )
     monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: False)
     monkeypatch.setattr(
         gateway_windows,
@@ -274,6 +288,164 @@ def test_install_refreshes_existing_task_without_mutating_registration(monkeypat
     assert calls == [("next",)]
     assert not startup_path.exists()
     assert not legacy_startup_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("stale_kind", "expected_detail"),
+    [
+        ("disabled", "disabled"),
+        ("old-launcher", "does not target the current gateway launcher"),
+        ("repeating", "logon trigger repeats"),
+        ("battery-limited", "blocked on battery power"),
+        ("untrusted-command", "does not launch the canonical wscript.exe"),
+        ("invalid-enabled", "invalid enabled setting"),
+        ("expired-boundary", "time boundaries"),
+        ("wrong-user", "belongs to another account"),
+        ("wrong-trigger-user", "logon trigger belongs to another account"),
+        ("idle-only", "requires an idle session"),
+        ("network-only", "requires network availability"),
+        ("volatile", "volatile"),
+        ("trigger-limited", "logon trigger has a bounded execution time"),
+        ("working-directory", "working directory"),
+        ("remoteapp-disabled", "RemoteApp sessions"),
+        ("malformed-command-quote", "canonical wscript.exe"),
+        ("required-privileges", "requires extra privileges"),
+    ],
+)
+def test_install_rejects_stale_existing_task_and_preserves_startup(
+    monkeypatch,
+    tmp_path,
+    stale_kind,
+    expected_detail,
+):
+    """A stale task must not displace the working per-user fallback."""
+    script_path = tmp_path / "Hermes_Gateway.cmd"
+    startup_path = tmp_path / "Startup" / "Hermes_Gateway.vbs"
+    legacy_startup_path = startup_path.with_suffix(".cmd")
+    startup_path.parent.mkdir()
+    startup_path.write_text("fallback", encoding="utf-8")
+    legacy_startup_path.write_text("fallback", encoding="utf-8")
+    task_xml = gateway_windows._build_scheduled_task_xml(
+        "Hermes_Gateway",
+        script_path.with_suffix(".vbs"),
+        "DOMAIN\\alice",
+    )
+    if stale_kind == "disabled":
+        task_xml = task_xml.replace(
+            "    <Enabled>true</Enabled>\n    <Hidden>",
+            "    <Enabled>false</Enabled>\n    <Hidden>",
+        )
+    elif stale_kind == "old-launcher":
+        task_xml = task_xml.replace(
+            str(script_path.with_suffix(".vbs")),
+            str(tmp_path / "old-home" / "Hermes_Gateway.vbs"),
+        )
+    elif stale_kind == "repeating":
+        task_xml = task_xml.replace(
+            "    </LogonTrigger>",
+            "      <Repetition><Interval>PT1M</Interval></Repetition>\n    </LogonTrigger>",
+        )
+    elif stale_kind == "battery-limited":
+        task_xml = task_xml.replace(
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+            "<DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>",
+        )
+    elif stale_kind == "untrusted-command":
+        task_xml = task_xml.replace(
+            "<Command>wscript.exe</Command>",
+            "<Command>C:\\untrusted\\wscript.exe</Command>",
+        )
+    elif stale_kind == "invalid-enabled":
+        task_xml = task_xml.replace(
+            "    <Enabled>true</Enabled>\n    <Hidden>",
+            "    <Enabled>bogus</Enabled>\n    <Hidden>",
+        )
+    elif stale_kind == "expired-boundary":
+        task_xml = task_xml.replace(
+            "      <Delay>PT30S</Delay>",
+            "      <StartBoundary>2020-01-01T00:00:00</StartBoundary>\n"
+            "      <EndBoundary>2020-01-02T00:00:00</EndBoundary>\n"
+            "      <Delay>PT30S</Delay>",
+        )
+    elif stale_kind == "wrong-user":
+        task_xml = task_xml.replace("DOMAIN\\alice", "DOMAIN\\bob")
+    elif stale_kind == "wrong-trigger-user":
+        task_xml = task_xml.replace(
+            "    <LogonTrigger>",
+            "    <LogonTrigger>\n      <UserId>DOMAIN\\bob</UserId>",
+        )
+    elif stale_kind == "idle-only":
+        task_xml = task_xml.replace(
+            "<RunOnlyIfIdle>false</RunOnlyIfIdle>",
+            "<RunOnlyIfIdle>true</RunOnlyIfIdle>",
+        )
+    elif stale_kind == "network-only":
+        task_xml = task_xml.replace(
+            "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
+            "<RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>",
+        )
+    elif stale_kind == "volatile":
+        task_xml = task_xml.replace(
+            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+            "    <Volatile>true</Volatile>",
+        )
+    elif stale_kind == "trigger-limited":
+        task_xml = task_xml.replace(
+            "      <Delay>PT30S</Delay>",
+            "      <Delay>PT30S</Delay>\n"
+            "      <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>",
+        )
+    elif stale_kind == "working-directory":
+        task_xml = task_xml.replace(
+            "      <Arguments>",
+            "      <WorkingDirectory>C:\\missing</WorkingDirectory>\n"
+            "      <Arguments>",
+        )
+    elif stale_kind == "remoteapp-disabled":
+        task_xml = task_xml.replace(
+            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+            "    <DisallowStartOnRemoteAppSession>true</DisallowStartOnRemoteAppSession>",
+        )
+    elif stale_kind == "malformed-command-quote":
+        task_xml = task_xml.replace(
+            "<Command>wscript.exe</Command>",
+            '<Command>"wscript.exe</Command>',
+        )
+    elif stale_kind == "required-privileges":
+        task_xml = task_xml.replace(
+            "      <LogonType>InteractiveToken</LogonType>",
+            "      <RequiredPrivileges>\n"
+            "        <Privilege>SeTcbPrivilege</Privilege>\n"
+            "      </RequiredPrivileges>\n"
+            "      <LogonType>InteractiveToken</LogonType>",
+        )
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_prompt_install_choices",
+        lambda start_now, start_on_login: (False, True),
+    )
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: "DOMAIN\\alice")
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user_sid", lambda: None, raising=False)
+    monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup_path)
+    monkeypatch.setattr(gateway_windows, "_legacy_startup_entry_path", lambda: legacy_startup_path)
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_exec_schtasks",
+        lambda args: (0, task_xml, "") if "/XML" in args else pytest.fail(f"unexpected schtasks call: {args}"),
+    )
+
+    with pytest.raises(RuntimeError, match=rf"not safe to retain.*{expected_detail}"):
+        gateway_windows.install(start_now=False, start_on_login=True)
+
+    assert startup_path.read_text(encoding="utf-8") == "fallback"
+    assert legacy_startup_path.read_text(encoding="utf-8") == "fallback"
 
 
 def test_install_removes_startup_owner_after_task_creation(monkeypatch, tmp_path):

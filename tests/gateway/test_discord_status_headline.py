@@ -534,6 +534,10 @@ def test_headline_uses_established_refresh_interval_key(monkeypatch) -> None:
     asyncio.run(_exercise_refresh_interval(monkeypatch))
 
 
+def test_headline_retries_on_discord_rate_limit_delay(monkeypatch) -> None:
+    asyncio.run(_exercise_rate_limit_retry(monkeypatch))
+
+
 async def _exercise_refresh_interval(monkeypatch) -> None:
     import gateway.status as gateway_status
     import plugins.platforms.discord.adapter as adapter_module
@@ -581,3 +585,56 @@ async def _exercise_refresh_interval(monkeypatch) -> None:
         await adapter._run_status_headline()
 
     assert delays == [600.0]
+
+
+async def _exercise_rate_limit_retry(monkeypatch) -> None:
+    import gateway.status as gateway_status
+    import plugins.platforms.discord.adapter as adapter_module
+    import plugins.platforms.discord.status_headline as headline_module
+
+    delays: list[float] = []
+
+    class RateLimitedHeadline:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.guild_id = 10
+
+        async def run_once(self):
+            raise RuntimeError("rate limited")
+
+    async def stop_after_delay(delay: float):
+        delays.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(headline_module, "StatusHeadline", RateLimitedHeadline)
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", stop_after_delay)
+    monkeypatch.setattr(
+        DiscordAdapter,
+        "_is_discord_rate_limit",
+        staticmethod(lambda exc: str(exc) == "rate limited"),
+    )
+    monkeypatch.setattr(
+        DiscordAdapter,
+        "_extract_discord_retry_after",
+        staticmethod(lambda exc: 59.5),
+    )
+    monkeypatch.setattr(
+        gateway_status,
+        "acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (True, None),
+    )
+    monkeypatch.setattr(gateway_status, "release_scoped_lock", lambda scope, identity: None)
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="not-used",
+            extra={"status_sidebar": {"enabled": True, "guild_id": 10}},
+        )
+    )
+    adapter._client = object()
+    adapter.gateway_runner = None
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._run_status_headline()
+
+    assert delays == [59.5]

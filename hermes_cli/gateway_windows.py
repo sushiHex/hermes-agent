@@ -750,6 +750,8 @@ def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tu
         return (False, "task requires network availability")
     if child_text(settings, "Volatile").lower() not in ("", "false"):
         return (False, "task is volatile")
+    if child_text(settings, "DisallowStartOnRemoteAppSession").lower() not in ("", "false"):
+        return (False, "task cannot start in RemoteApp sessions")
     if child_text(settings, "MultipleInstancesPolicy") != "IgnoreNew":
         return (False, "task does not use IgnoreNew")
     if child_text(settings, "ExecutionTimeLimit") != "PT0S":
@@ -801,6 +803,8 @@ def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tu
     command = child_text(action, "Command").strip('"')
     if command.lower() != "wscript.exe":
         return (False, "task does not launch the canonical wscript.exe")
+    if child_text(action, "WorkingDirectory"):
+        return (False, "task action has a working directory")
     expected_args = f'//B //Nologo "{launcher_path}"'
     if os.path.normcase(child_text(action, "Arguments")) != os.path.normcase(expected_args):
         return (False, "task does not target the current gateway launcher")

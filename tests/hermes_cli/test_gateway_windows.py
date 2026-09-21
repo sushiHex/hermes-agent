@@ -306,6 +306,8 @@ def test_install_refreshes_existing_task_without_mutating_registration(monkeypat
         ("network-only", "requires network availability"),
         ("volatile", "volatile"),
         ("trigger-limited", "logon trigger has a bounded execution time"),
+        ("working-directory", "working directory"),
+        ("remoteapp-disabled", "RemoteApp sessions"),
     ],
 )
 def test_install_rejects_stale_existing_task_and_preserves_startup(
@@ -391,6 +393,18 @@ def test_install_rejects_stale_existing_task_and_preserves_startup(
             "      <Delay>PT30S</Delay>",
             "      <Delay>PT30S</Delay>\n"
             "      <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>",
+        )
+    elif stale_kind == "working-directory":
+        task_xml = task_xml.replace(
+            "      <Arguments>",
+            "      <WorkingDirectory>C:\\missing</WorkingDirectory>\n"
+            "      <Arguments>",
+        )
+    elif stale_kind == "remoteapp-disabled":
+        task_xml = task_xml.replace(
+            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+            "    <DisallowStartOnRemoteAppSession>true</DisallowStartOnRemoteAppSession>",
         )
 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)

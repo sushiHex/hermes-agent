@@ -2205,6 +2205,7 @@ class DiscordAdapter(BasePlatformAdapter):
         lock_identity = None
         try:
             while self._client is client:
+                delay = interval
                 try:
                     if headline is None:
                         candidate = StatusHeadline(client, discord, config, self.gateway_runner)
@@ -2240,7 +2241,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise
                 except Exception as exc:
                     logger.warning("[%s] Status headline refused update: %s", self.name, exc)
-                await asyncio.sleep(interval)
+                    if self._is_discord_rate_limit(exc):
+                        retry_after = self._extract_discord_retry_after(exc)
+                        if retry_after is not None:
+                            delay = retry_after
+                await asyncio.sleep(delay)
         finally:
             if (
                 owned_guild_id is not None

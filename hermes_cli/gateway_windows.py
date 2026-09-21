@@ -795,12 +795,14 @@ def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tu
     run_level = child_text(principal, "RunLevel")
     if run_level not in ("", "LeastPrivilege"):
         return (False, "task does not use least privilege")
+    if principal.find(".//{*}RequiredPrivileges") is not None:
+        return (False, "task principal requires extra privileges")
 
     action_nodes = list(actions)
     if len(action_nodes) != 1 or action_nodes[0].tag.rsplit("}", 1)[-1] != "Exec":
         return (False, "task does not have exactly one executable action")
     action = action_nodes[0]
-    command = child_text(action, "Command").strip('"')
+    command = child_text(action, "Command")
     if command.lower() != "wscript.exe":
         return (False, "task does not launch the canonical wscript.exe")
     if child_text(action, "WorkingDirectory"):

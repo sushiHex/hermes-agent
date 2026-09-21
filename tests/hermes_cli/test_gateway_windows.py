@@ -308,6 +308,8 @@ def test_install_refreshes_existing_task_without_mutating_registration(monkeypat
         ("trigger-limited", "logon trigger has a bounded execution time"),
         ("working-directory", "working directory"),
         ("remoteapp-disabled", "RemoteApp sessions"),
+        ("malformed-command-quote", "canonical wscript.exe"),
+        ("required-privileges", "requires extra privileges"),
     ],
 )
 def test_install_rejects_stale_existing_task_and_preserves_startup(
@@ -405,6 +407,19 @@ def test_install_rejects_stale_existing_task_and_preserves_startup(
             "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
             "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
             "    <DisallowStartOnRemoteAppSession>true</DisallowStartOnRemoteAppSession>",
+        )
+    elif stale_kind == "malformed-command-quote":
+        task_xml = task_xml.replace(
+            "<Command>wscript.exe</Command>",
+            '<Command>"wscript.exe</Command>',
+        )
+    elif stale_kind == "required-privileges":
+        task_xml = task_xml.replace(
+            "      <LogonType>InteractiveToken</LogonType>",
+            "      <RequiredPrivileges>\n"
+            "        <Privilege>SeTcbPrivilege</Privilege>\n"
+            "      </RequiredPrivileges>\n"
+            "      <LogonType>InteractiveToken</LogonType>",
         )
 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)

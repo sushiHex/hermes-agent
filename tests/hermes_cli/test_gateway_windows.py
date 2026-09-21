@@ -301,6 +301,9 @@ def test_install_refreshes_existing_task_without_mutating_registration(monkeypat
         ("invalid-enabled", "invalid enabled setting"),
         ("expired-boundary", "time boundaries"),
         ("wrong-user", "belongs to another account"),
+        ("wrong-trigger-user", "logon trigger belongs to another account"),
+        ("idle-only", "requires an idle session"),
+        ("network-only", "requires network availability"),
     ],
 )
 def test_install_rejects_stale_existing_task_and_preserves_startup(
@@ -360,6 +363,21 @@ def test_install_rejects_stale_existing_task_and_preserves_startup(
         )
     elif stale_kind == "wrong-user":
         task_xml = task_xml.replace("DOMAIN\\alice", "DOMAIN\\bob")
+    elif stale_kind == "wrong-trigger-user":
+        task_xml = task_xml.replace(
+            "    <LogonTrigger>",
+            "    <LogonTrigger>\n      <UserId>DOMAIN\\bob</UserId>",
+        )
+    elif stale_kind == "idle-only":
+        task_xml = task_xml.replace(
+            "<RunOnlyIfIdle>false</RunOnlyIfIdle>",
+            "<RunOnlyIfIdle>true</RunOnlyIfIdle>",
+        )
+    elif stale_kind == "network-only":
+        task_xml = task_xml.replace(
+            "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
+            "<RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>",
+        )
 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(

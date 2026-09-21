@@ -722,6 +722,19 @@ def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tu
         child = parent.find(f"{{*}}{tag}")
         return (child.text or "").strip() if child is not None else ""
 
+    current_user = _resolve_task_user()
+    current_sid: str | None = None
+    current_sid_resolved = False
+
+    def identity_matches_current(identity: str) -> bool:
+        nonlocal current_sid, current_sid_resolved
+        if current_user and identity.casefold() == current_user.casefold():
+            return True
+        if not current_sid_resolved:
+            current_sid = _resolve_task_user_sid()
+            current_sid_resolved = True
+        return bool(current_sid and identity.casefold() == current_sid.casefold())
+
     task_enabled = child_text(settings, "Enabled").lower()
     if task_enabled not in ("", "true", "false"):
         return (False, "task has an invalid enabled setting")
@@ -731,6 +744,10 @@ def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tu
         return (False, "task can be blocked on battery power")
     if child_text(settings, "StopIfGoingOnBatteries").lower() != "false":
         return (False, "task can stop on battery power")
+    if child_text(settings, "RunOnlyIfIdle").lower() not in ("", "false"):
+        return (False, "task requires an idle session")
+    if child_text(settings, "RunOnlyIfNetworkAvailable").lower() not in ("", "false"):
+        return (False, "task requires network availability")
     if child_text(settings, "MultipleInstancesPolicy") != "IgnoreNew":
         return (False, "task does not use IgnoreNew")
     if child_text(settings, "ExecutionTimeLimit") != "PT0S":
@@ -756,13 +773,12 @@ def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tu
     if trigger.find(".//{*}Repetition") is not None:
         return (False, "task logon trigger repeats")
 
+    trigger_user_id = child_text(trigger, "UserId")
+    if trigger_user_id and not identity_matches_current(trigger_user_id):
+        return (False, "task logon trigger belongs to another account")
+
     task_user_id = child_text(principal, "UserId")
-    current_user = _resolve_task_user()
-    identity_matches = bool(current_user and task_user_id.casefold() == current_user.casefold())
-    if not identity_matches:
-        current_sid = _resolve_task_user_sid()
-        identity_matches = bool(current_sid and task_user_id.casefold() == current_sid.casefold())
-    if not identity_matches:
+    if not identity_matches_current(task_user_id):
         return (False, "task principal belongs to another account")
     if child_text(principal, "LogonType") != "InteractiveToken":
         return (False, "task does not use the interactive user token")

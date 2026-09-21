@@ -38,6 +38,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 from hermes_cli._subprocess_compat import (
@@ -668,6 +669,80 @@ def _write_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
     return xml_path
 
 
+def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tuple[bool, str]:
+    """Return whether an existing task is the safe canonical login owner."""
+    code, out, err = _exec_schtasks(["/Query", "/TN", task_name, "/XML"])
+    if code != 0:
+        detail = (err or out or f"schtasks exited with code {code}").strip()
+        return (False, f"task XML query failed: {detail}")
+
+    try:
+        root = ElementTree.fromstring(out)
+    except (ElementTree.ParseError, ValueError) as exc:
+        return (False, f"task XML could not be parsed: {exc}")
+
+    settings = root.find(".//{*}Settings")
+    triggers = root.find(".//{*}Triggers")
+    actions = root.find(".//{*}Actions")
+    principal = root.find(".//{*}Principals/{*}Principal")
+    if settings is None or triggers is None or actions is None or principal is None:
+        return (False, "task XML is missing required sections")
+
+    def child_text(parent: ElementTree.Element, tag: str) -> str:
+        child = parent.find(f"{{*}}{tag}")
+        return (child.text or "").strip() if child is not None else ""
+
+    task_enabled = child_text(settings, "Enabled").lower()
+    if task_enabled not in ("", "true", "false"):
+        return (False, "task has an invalid enabled setting")
+    if task_enabled == "false":
+        return (False, "task is disabled")
+    if child_text(settings, "DisallowStartIfOnBatteries").lower() != "false":
+        return (False, "task can be blocked on battery power")
+    if child_text(settings, "StopIfGoingOnBatteries").lower() != "false":
+        return (False, "task can stop on battery power")
+    if child_text(settings, "MultipleInstancesPolicy") != "IgnoreNew":
+        return (False, "task does not use IgnoreNew")
+    if child_text(settings, "ExecutionTimeLimit") != "PT0S":
+        return (False, "task does not have an unlimited execution time")
+    if child_text(settings, "StartWhenAvailable").lower() not in ("", "false"):
+        return (False, "task enables catch-up starts")
+    if settings.find("{*}RestartOnFailure") is not None:
+        return (False, "task delegates retries to Task Scheduler")
+
+    trigger_nodes = list(triggers)
+    if len(trigger_nodes) != 1 or trigger_nodes[0].tag.rsplit("}", 1)[-1] != "LogonTrigger":
+        return (False, "task does not have exactly one logon trigger")
+    trigger = trigger_nodes[0]
+    trigger_enabled = child_text(trigger, "Enabled").lower()
+    if trigger_enabled not in ("", "true", "false"):
+        return (False, "task logon trigger has an invalid enabled setting")
+    if trigger_enabled == "false":
+        return (False, "task logon trigger is disabled")
+    if child_text(trigger, "Delay") != _TASK_LOGON_DELAY:
+        return (False, "task logon delay is not canonical")
+    if trigger.find(".//{*}Repetition") is not None:
+        return (False, "task logon trigger repeats")
+
+    if child_text(principal, "LogonType") != "InteractiveToken":
+        return (False, "task does not use the interactive user token")
+    run_level = child_text(principal, "RunLevel")
+    if run_level not in ("", "LeastPrivilege"):
+        return (False, "task does not use least privilege")
+
+    action_nodes = list(actions)
+    if len(action_nodes) != 1 or action_nodes[0].tag.rsplit("}", 1)[-1] != "Exec":
+        return (False, "task does not have exactly one executable action")
+    action = action_nodes[0]
+    command = child_text(action, "Command").strip('"')
+    if command.lower() != "wscript.exe":
+        return (False, "task does not launch the canonical wscript.exe")
+    expected_args = f'//B //Nologo "{launcher_path}"'
+    if os.path.normcase(child_text(action, "Arguments")) != os.path.normcase(expected_args):
+        return (False, "task does not target the current gateway launcher")
+    return (True, "task registration is canonical")
+
+
 def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, str]:
     """Create or replace the Scheduled Task. Returns (success, detail).
 
@@ -1077,11 +1152,12 @@ def install(
 ) -> None:
     """Install Windows login persistence, preferring an existing Scheduled Task.
 
-    Idempotent: an existing task registration is preserved while its stable
-    launcher is refreshed to the current Python/project paths. A task-free
-    profile attempts registration and falls back to the per-user Startup folder
-    when Task Scheduler denies it. ``force`` is accepted for API parity with
-    ``launchd_install`` / ``systemd_install``.
+    Idempotent: a canonical existing task registration is preserved while its
+    stable launcher is refreshed to the current Python/project paths. A stale or
+    unreadable registration is left untouched, along with any Startup fallback,
+    and reported as an error. A task-free profile attempts registration and falls
+    back to the per-user Startup folder when Task Scheduler denies it. ``force``
+    is accepted for API parity with ``launchd_install`` / ``systemd_install``.
     """
     _assert_windows()
     start_now, start_on_login = _prompt_install_choices(start_now, start_on_login)
@@ -1104,6 +1180,15 @@ def install(
     script_path = _write_task_script()
 
     if is_task_registered():
+        task_is_safe, task_detail = _validate_existing_scheduled_task(
+            task_name,
+            script_path.with_suffix(".vbs"),
+        )
+        if not task_is_safe:
+            raise RuntimeError(
+                f"Existing Scheduled Task {task_name!r} is not safe to retain: {task_detail}. "
+                "Its registration and any Startup fallback were preserved."
+            )
         ok, detail = True, f"Retained existing Scheduled Task {task_name!r}; refreshed its launcher"
     else:
         ok, detail = _install_scheduled_task(task_name, script_path)

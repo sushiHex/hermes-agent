@@ -257,6 +257,8 @@ def test_install_refreshes_existing_task_without_mutating_registration(monkeypat
         script_path,
         "DOMAIN\\alice",
     ).replace("      <RunLevel>LeastPrivilege</RunLevel>\n", "")
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: "DOMAIN\\alice")
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user_sid", lambda: None)
     monkeypatch.setattr(
         gateway_windows,
         "_exec_schtasks",
@@ -297,6 +299,8 @@ def test_install_refreshes_existing_task_without_mutating_registration(monkeypat
         ("battery-limited", "blocked on battery power"),
         ("untrusted-command", "does not launch the canonical wscript.exe"),
         ("invalid-enabled", "invalid enabled setting"),
+        ("expired-boundary", "time boundaries"),
+        ("wrong-user", "belongs to another account"),
     ],
 )
 def test_install_rejects_stale_existing_task_and_preserves_startup(
@@ -347,6 +351,15 @@ def test_install_rejects_stale_existing_task_and_preserves_startup(
             "    <Enabled>true</Enabled>\n    <Hidden>",
             "    <Enabled>bogus</Enabled>\n    <Hidden>",
         )
+    elif stale_kind == "expired-boundary":
+        task_xml = task_xml.replace(
+            "      <Delay>PT30S</Delay>",
+            "      <StartBoundary>2020-01-01T00:00:00</StartBoundary>\n"
+            "      <EndBoundary>2020-01-02T00:00:00</EndBoundary>\n"
+            "      <Delay>PT30S</Delay>",
+        )
+    elif stale_kind == "wrong-user":
+        task_xml = task_xml.replace("DOMAIN\\alice", "DOMAIN\\bob")
 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(
@@ -356,6 +369,8 @@ def test_install_rejects_stale_existing_task_and_preserves_startup(
     )
     monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
     monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: "DOMAIN\\alice")
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user_sid", lambda: None, raising=False)
     monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup_path)
     monkeypatch.setattr(gateway_windows, "_legacy_startup_entry_path", lambda: legacy_startup_path)
     monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)

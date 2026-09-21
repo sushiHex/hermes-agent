@@ -27,6 +27,7 @@ Design notes
 
 from __future__ import annotations
 
+import csv
 import ctypes
 import locale
 import logging
@@ -605,6 +606,35 @@ def _resolve_task_user() -> str | None:
     return f"{domain}\\{username}" if domain else username
 
 
+def _resolve_task_user_sid() -> str | None:
+    """Return the current Windows account SID using native ``whoami.exe``."""
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        return None
+    whoami = Path(system_root) / "System32" / "whoami.exe"
+    try:
+        proc = subprocess.run(
+            [str(whoami), "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            encoding=_schtasks_encoding(),
+            errors="replace",
+            timeout=_SCHTASKS_TIMEOUT_S,
+            creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        row = next(csv.reader(proc.stdout.splitlines()))
+    except (StopIteration, csv.Error):
+        return None
+    if len(row) < 2 or not row[1].upper().startswith("S-"):
+        return None
+    return row[1]
+
+
 def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | None) -> str:
     """Render a Task Scheduler XML definition with safe long-running defaults.
 
@@ -721,9 +751,19 @@ def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tu
         return (False, "task logon trigger is disabled")
     if child_text(trigger, "Delay") != _TASK_LOGON_DELAY:
         return (False, "task logon delay is not canonical")
+    if trigger.find("{*}StartBoundary") is not None or trigger.find("{*}EndBoundary") is not None:
+        return (False, "task logon trigger has time boundaries")
     if trigger.find(".//{*}Repetition") is not None:
         return (False, "task logon trigger repeats")
 
+    task_user_id = child_text(principal, "UserId")
+    current_user = _resolve_task_user()
+    identity_matches = bool(current_user and task_user_id.casefold() == current_user.casefold())
+    if not identity_matches:
+        current_sid = _resolve_task_user_sid()
+        identity_matches = bool(current_sid and task_user_id.casefold() == current_sid.casefold())
+    if not identity_matches:
+        return (False, "task principal belongs to another account")
     if child_text(principal, "LogonType") != "InteractiveToken":
         return (False, "task does not use the interactive user token")
     run_level = child_text(principal, "RunLevel")

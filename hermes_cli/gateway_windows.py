@@ -772,6 +772,12 @@ def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tu
         return (False, "task logon delay is not canonical")
     if trigger.find("{*}StartBoundary") is not None or trigger.find("{*}EndBoundary") is not None:
         return (False, "task logon trigger has time boundaries")
+    trigger_execution_limit = trigger.find("{*}ExecutionTimeLimit")
+    if (
+        trigger_execution_limit is not None
+        and child_text(trigger, "ExecutionTimeLimit") != "PT0S"
+    ):
+        return (False, "task logon trigger has a bounded execution time")
     if trigger.find(".//{*}Repetition") is not None:
         return (False, "task logon trigger repeats")
 

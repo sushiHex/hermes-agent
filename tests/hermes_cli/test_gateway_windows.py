@@ -305,6 +305,7 @@ def test_install_refreshes_existing_task_without_mutating_registration(monkeypat
         ("idle-only", "requires an idle session"),
         ("network-only", "requires network availability"),
         ("volatile", "volatile"),
+        ("trigger-limited", "logon trigger has a bounded execution time"),
     ],
 )
 def test_install_rejects_stale_existing_task_and_preserves_startup(
@@ -384,6 +385,12 @@ def test_install_rejects_stale_existing_task_and_preserves_startup(
             "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
             "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
             "    <Volatile>true</Volatile>",
+        )
+    elif stale_kind == "trigger-limited":
+        task_xml = task_xml.replace(
+            "      <Delay>PT30S</Delay>",
+            "      <Delay>PT30S</Delay>\n"
+            "      <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>",
         )
 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)

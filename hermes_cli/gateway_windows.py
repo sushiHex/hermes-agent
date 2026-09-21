@@ -748,6 +748,8 @@ def _validate_existing_scheduled_task(task_name: str, launcher_path: Path) -> tu
         return (False, "task requires an idle session")
     if child_text(settings, "RunOnlyIfNetworkAvailable").lower() not in ("", "false"):
         return (False, "task requires network availability")
+    if child_text(settings, "Volatile").lower() not in ("", "false"):
+        return (False, "task is volatile")
     if child_text(settings, "MultipleInstancesPolicy") != "IgnoreNew":
         return (False, "task does not use IgnoreNew")
     if child_text(settings, "ExecutionTimeLimit") != "PT0S":

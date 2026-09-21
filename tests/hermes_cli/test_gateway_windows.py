@@ -304,6 +304,7 @@ def test_install_refreshes_existing_task_without_mutating_registration(monkeypat
         ("wrong-trigger-user", "logon trigger belongs to another account"),
         ("idle-only", "requires an idle session"),
         ("network-only", "requires network availability"),
+        ("volatile", "volatile"),
     ],
 )
 def test_install_rejects_stale_existing_task_and_preserves_startup(
@@ -377,6 +378,12 @@ def test_install_rejects_stale_existing_task_and_preserves_startup(
         task_xml = task_xml.replace(
             "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
             "<RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>",
+        )
+    elif stale_kind == "volatile":
+        task_xml = task_xml.replace(
+            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+            "    <Volatile>true</Volatile>",
         )
 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
